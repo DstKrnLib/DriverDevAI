@@ -1,0 +1,285 @@
+import os
+import subprocess
+import time
+import google.generativeai as genai
+import re
+import sys
+import json  # For structured data exchange with Gemini
+
+# --- Configuration ---
+GEMINI_API_KEY = "GEMINI_API_KEY"  # Replace with your actual API key
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-pro')
+
+# --- Helper Functions ---
+
+def run_command(command_list, error_message):
+    try:
+        result = subprocess.run(command_list, capture_output=True, text=True, check=True)
+        print(result.stdout.strip())
+        return result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        print(f"{error_message}: {e}")
+        print(f"Stderr: {e.stderr}")
+        return None
+    except FileNotFoundError:
+        print(f"{error_message}: Command not found.")
+        return None
+
+def check_and_install_adb_termux():
+    print("\n--- Checking ADB in Termux ---")
+    if run_command(['adb', 'version'], "Error checking ADB version"):
+        print("ADB is already installed.")
+        return True
+    else:
+        print("ADB not found. Attempting installation using pkg...")
+        if run_command(['pkg', 'install', 'android-tools', '-y'], "Error installing android-tools (ADB and Fastboot)"):
+            if run_command(['adb', 'version'], "Error checking ADB version after installation"):
+                print("ADB installed successfully.")
+                return True
+            else:
+                print("ADB installation via pkg failed or ADB is still not found.")
+                return False
+        else:
+            print("pkg command failed. Ensure pkg is working in your Termux environment.")
+            return False
+
+def check_and_install_adb_desktop():
+    print("\n--- Checking and Installing ADB (Desktop) ---")
+    if run_command(['adb', 'version'], "Error checking ADB version"):
+        print("ADB is already installed.")
+        return True
+    else:
+        print("ADB not found. Attempting installation...")
+        if sys.platform.startswith('linux'):
+            if run_command(['sudo', 'apt', 'update'], "Error updating package list"):
+                return run_command(['sudo', 'apt', 'install', 'android-tools-adb', 'android-tools-fastboot', '-y'], "Error installing ADB and Fastboot")
+        elif sys.platform.startswith('darwin'):  # macOS
+            if run_command(['brew', '--version'], "Error checking Homebrew"):
+                return run_command(['brew', 'install', '--cask', 'android-platform-tools'], "Error installing ADB via Homebrew")
+            else:
+                print("Homebrew not found. Please install it and try again.")
+                return False
+        elif sys.platform.startswith('win'):
+            print("Windows installation of ADB is more involved. Please ensure 'Android SDK Platform-Tools' are installed and added to your PATH.")
+            print("You can download them from the official Android Studio website or use a package manager like Chocolatey.")
+            return False
+        else:
+            print(f"Unsupported operating system: {sys.platform}. Please install ADB and Fastboot manually.")
+            return False
+        return True
+
+def check_and_install_fastboot_termux():
+    print("\n--- Checking Fastboot in Termux ---")
+    if run_command(['fastboot', 'version'], "Error checking Fastboot version"):
+        print("Fastboot is already installed.")
+        return True
+    else:
+        print("Fastboot not found. Assuming it was installed with android-tools.")
+        if run_command(['fastboot', 'version'], "Error checking Fastboot version after potential ADB install"):
+            print("Fastboot is available.")
+            return True
+        else:
+            print("Fastboot is not available. Ensure android-tools are installed correctly.")
+            return False
+
+def check_and_install_fastboot_desktop():
+    print("\n--- Checking Fastboot (Desktop) ---")
+    if run_command(['fastboot', 'version'], "Error checking Fastboot version"):
+        print("Fastboot is already installed.")
+        return True
+    else:
+        print("Fastboot not found. Please ensure it's installed (it's often with ADB).")
+        return False
+
+def execute_adb_command(command):
+    in_termux = "com.termux" in sys.modules
+    if in_termux:
+        if not check_and_install_adb_termux():
+            return None
+    else:
+        if not check_and_install_adb_desktop():
+            return None
+    full_command = ['adb'] + command.split()
+    return run_command(full_command, f"Error executing ADB command: '{command}'")
+
+def analyze_hardware_with_gemini_refined(hardware_data):
+    prompt = f"""Analyze the following detailed hardware information from an Android device. Identify the key hardware components that would require separate drivers for Ubuntu Touch. For each component, extract the model name, chipset identifier, vendor, and any other relevant specifications. Output your findings as a JSON object where each key is a component type (e.g., "CPU", "GPU", "Wi-Fi") and the value is a dictionary containing the extracted details (e.g., {{"model": "Snapdragon 888", "vendor": "Qualcomm", "architecture": "ARMv8"}}).
+
+    Hardware Data:
+    ```
+    {hardware_data}
+    ```
+    """
+    try:
+        response = model.generate_content(prompt)
+        try:
+            return json.loads(response.text)
+        except json.JSONDecodeError:
+            print(f"Warning: Gemini's hardware analysis output was not valid JSON:\n{response.text}")
+            return {}
+    except Exception as e:
+        print(f"Error communicating with Gemini for hardware analysis: {e}")
+        return {}
+
+def find_ubuntu_touch_drivers_with_gemini_refined(component_details):
+    component_name = component_details.get("model") or component_details.get("chipset") or component_details.get("type", "Unknown Component")
+    search_terms = ", ".join(component_details.values())
+    prompt = f"""Search for existing open-source drivers compatible with the following hardware component for Ubuntu Touch or general Linux distributions that could be adapted. Provide links to relevant repositories (e.g., GitHub, Launchpad), documentation, kernel module names, and any specific instructions or notes related to Ubuntu Touch compatibility.
+
+    Component Details:
+    ```json
+    {json.dumps(component_details)}
+    ```
+
+    Search terms: {search_terms}
+    """
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Error communicating with Gemini for driver search: {e}"
+
+def attempt_driver_creation_guidance_with_gemini_refined(component_details, existing_driver_info=""):
+    component_name = component_details.get("model") or component_details.get("chipset") or component_details.get("type", "Unknown Component")
+    details_str = json.dumps(component_details)
+    prompt = f"""Given the following detailed hardware information for '{component_name}': '{details_str}', and any existing information about potential drivers: '{existing_driver_info}', provide guidance on how one might approach creating a driver for this component for Ubuntu Touch. Include potential relevant Linux kernel subsystems, similar existing driver examples in the Linux kernel, essential development tools, and any known challenges or platform-specific considerations for Ubuntu Touch. Emphasize that this is a complex task requiring significant driver development expertise. If specific information is lacking, suggest ways to further investigate the hardware."""
+    try:
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"Error communicating with Gemini for driver creation guidance: {e}"
+
+def create_driver_placeholder(component_name, component_details, driver_info, creation_guidance):
+    """Creates a placeholder file for a potential driver."""
+    filename = f"driver_{component_name.replace(' ', '_').lower()}.c"
+    metadata = {
+        "component_name": component_name,
+        "details": component_details,
+        "driver_search_results": driver_info,
+        "creation_guidance": creation_guidance
+    }
+    try:
+        with open(filename, "w") as f:
+            f.write(f"// Placeholder driver file for {component_name}\n")
+            f.write(f"// Component Details: {json.dumps(component_details, indent=4)}\n")
+            f.write("// Driver Search Results:\n// {}\n".format(driver_info.replace('\n', '\n// ')))
+            f.write("// Driver Creation Guidance:\n// {}\n".format(creation_guidance.replace('\n', '\n// ')))
+            f.write("\n// Actual driver code would go here...\n")
+        return filename
+    except Exception as e:
+        print(f"Error creating driver placeholder file for {component_name}: {e}")
+        return None
+
+# --- Main Program Flow ---
+
+def main():
+    print("Welcome to Ubuntu Touch Driver Builder AI")
+
+    in_termux = "com.termux" in sys.modules
+
+    if in_termux:
+        if not check_and_install_adb_termux():
+            print("ADB installation failed or was not completed in Termux. Please ensure ADB is working before proceeding.")
+            return
+        # check_and_install_fastboot_termux() # Optional
+    else:
+        if not check_and_install_adb_desktop():
+            print("ADB installation failed or was not completed. Please ensure ADB is working before proceeding.")
+            return
+        # check_and_install_fastboot_desktop() # Optional
+
+    # 1. Gather Detailed Hardware Information
+    print("\n--- Gathering Detailed Hardware Information ---")
+    hardware_data = {}
+
+    # System Properties
+    if props := execute_adb_command("shell getprop"):
+        hardware_data['system_properties'] = props
+
+    # /proc/cpuinfo
+    if cpuinfo := execute_adb_command("shell cat /proc/cpuinfo"):
+        hardware_data['proc_cpuinfo'] = cpuinfo
+
+    # /sys/class
+    if sysclass := execute_adb_command("shell ls -R /sys/class"):
+        hardware_data['sys_class'] = sysclass
+
+    # /dev
+    if dev := execute_adb_command("shell ls -l /dev"):
+        hardware_data['dev'] = dev
+
+    # dmesg
+    if dmesg_output := execute_adb_command("shell dmesg"):
+        hardware_data['dmesg'] = dmesg_output
+
+    # PCI Devices
+    if pci_devices := execute_adb_command("shell ls -l /sys/bus/pci/devices"):
+        hardware_data['pci_devices'] = pci_devices
+
+    # USB Devices
+    if usb_devices := execute_adb_command
+		if usb_devices := execute_adb_command("shell ls -l /sys/bus/usb/devices"):
+        hardware_data['usb_devices'] = usb_devices
+
+    print("Detailed hardware data collected.")
+
+    # 2. Analyze with Gemini for Key Components
+    print("\n--- Identifying Key Hardware Components with Gemini ---")
+    identified_components = analyze_hardware_with_gemini_refined(json.dumps(hardware_data))
+    print(f"Gemini's Component Identification:\n{json.dumps(identified_components, indent=4)}")
+
+    if not identified_components:
+        print("Could not identify key hardware components. Exiting.")
+        return
+
+    # 3. Search for Ubuntu Touch Drivers and Get Creation Guidance
+    print("\n--- Searching for Drivers and Getting Creation Guidance ---")
+    driver_files = []
+    component_info_list = []
+
+    for component_type, details in identified_components.items():
+        print(f"\n--- Processing Component: {component_type} ---")
+        component_details = {"type": component_type, **details}
+
+        # Search for existing drivers
+        driver_search_result = find_ubuntu_touch_drivers_with_gemini_refined(component_details)
+        print(f"Driver search results for '{component_type}':\n{driver_search_result}")
+
+        # Get driver creation guidance if no direct drivers are found
+        creation_guidance = ""
+        if "No specific drivers found" in driver_search_result.lower() or not driver_search_result.strip():
+            print(f"\nRequesting driver creation guidance for '{component_type}'...")
+            creation_guidance = attempt_driver_creation_guidance_with_gemini_refined(component_details, driver_search_result)
+            print(f"Driver creation guidance for '{component_type}':\n{creation_guidance}")
+
+        # Create a placeholder driver file
+        placeholder_file = create_driver_placeholder(component_type, component_details, driver_search_result, creation_guidance)
+        if placeholder_file:
+            driver_files.append(placeholder_file)
+            component_info = {
+                "component_type": component_type,
+                "details": component_details,
+                "driver_file": placeholder_file
+            }
+            component_info_list.append(component_info)
+
+    # 4. Generate README File
+    print("\n--- Generating README File ---")
+    with open("README_drivers.txt", "w") as readme_file:
+        readme_file.write("Ubuntu Touch Driver Analysis\n")
+        readme_file.write("===========================\n\n")
+        readme_file.write("This file lists the identified hardware components and the generated placeholder driver files based on the analysis.\n\n")
+        readme_file.write("| Component Type | Details | Placeholder Driver File |\n")
+        readme_file.write("|----------------|---------|-------------------------|\n")
+        for info in component_info_list:
+            details_str = ", ".join([f"{k}: {v}" for k, v in info['details'].items()])
+            readme_file.write(f"| {info['component_type']} | {details_str} | {info['driver_file']} |\n")
+        readme_file.write("\n**Note:** The generated driver files are placeholders containing metadata and guidance. Actual driver implementation requires significant hardware and kernel development expertise.\n")
+
+    print("\nDriver analysis and placeholder file generation complete.")
+    print(f"Generated driver placeholder files: {driver_files}")
+    print("A README file 'README_drivers.txt' has been created.")
+
+if __name__ == "__main__":
+    main()
